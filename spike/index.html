@@ -117,21 +117,19 @@
   const MIN_HZ = 50, MAX_HZ = 18000, UNRELIABLE_BELOW_HZ = 150;
   const DB_MIN = -120, DB_MAX = 0;
 
+  // 第2回: 第1回（2026-11-09, iOS 18.7）で切り分けられなかった点だけを確認する
   const CHECKS = [
-    ['R1a', 'R1: マイク停止中に③で鳴らすと、下部スピーカーから普通の音量で聞こえる'],
-    ['R1b', 'R1: マイク開始後に③で鳴らすと、音が小さくなる/受話口（上部）から聞こえる'],
-    ['R1c', 'R1: Audio Session を play-and-record にしてマイク開始→鳴らすと、下部スピーカーから聞こえる'],
-    ['R1d', 'R1: Audio Session を playback にすると改善する'],
-    ['R2a', 'R2: 消音スイッチ（消音モード）ON で、③の音が鳴らない'],
-    ['R2b', 'R2: 消音 ON でも Audio Session = playback なら鳴る'],
-    ['R3a', 'R3: マイク開始中に③で 1000Hz を鳴らすと、ピーク表示がほぼ 1000Hz で安定する'],
-    ['R3b', 'R3: 同じ音を鳴らし続けると、レベルが数秒かけて下がる/上下する（自動補正が効いている疑い）'],
-    ['R3c', 'R3: 「アー」と一定の声を出すと、声の後に周囲音が不自然に小さく/大きくなる'],
-    ['R4a', 'R4: 100Hz を鳴らしてもピークが 100Hz にならない（低域が拾えない）'],
-    ['R5a', 'R5: 別アプリに切り替えて戻ると、マイクや音が止まっている'],
-    ['R6a', 'R6: Wake Lock 有効中、放置しても画面が消えない'],
-    ['R6b', 'R6: 画面ロック→解除後、マイクが止まっている（状態表示を確認）'],
-    ['R7a', 'R7: 保存の永続化が「許可」された'],
+    ['R1a', 'R1: ページを再読み込みし、マイクを一度も使わずに鳴らすと、下部スピーカーから普通の音量で聞こえる'],
+    ['R1e', 'R1: マイク開始 → 「マイク停止」→ 鳴らすと、普通の音量に戻る'],
+    ['R1f', 'R1: マイク開始 → 「マイク停止」→ Audio Session を playback → 鳴らすと、普通の音量に戻る'],
+    ['R1c', 'R1: Audio Session を play-and-record → マイク開始 → 鳴らすと、下部スピーカーから普通の音量で聞こえる'],
+    ['R2a', 'R2: 消音モード ON・Audio Session 指定なしで鳴らすと、音が出ない'],
+    ['R2b', 'R2: 消音モード ON でも Audio Session = playback なら鳴る'],
+    ['R3b', 'R3: 別の機器から一定の音を鳴らし続けると、iPhone 側のレベルが数秒かけて下がる/上下する'],
+    ['R4b', 'R4: 別の機器（PC でこのページを開くなど）から 100Hz を鳴らすと、ピークが 100Hz 付近を示す'],
+    ['R4c', 'R4: 同様に 150Hz を鳴らすと、ピークが 150Hz 付近を示す'],
+    ['R4d', 'R4: ベースの開放弦（A=55Hz / E=41Hz）やギターの6弦（E=82Hz）を鳴らすと、その付近を示す'],
+    ['R7b', 'R7: ホーム画面に追加して、そこから開くと、保存の永続化が「許可」される'],
   ];
 
   const $ = (id) => document.getElementById(id);
@@ -163,6 +161,7 @@
       ['HTTPS (secure context)', window.isSecureContext],
       ['standalone (ホーム画面から起動)', window.navigator.standalone === true || matchMedia('(display-mode: standalone)').matches],
       ['getUserMedia', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)],
+      ['対応している制約', supportedConstraints()],
       ['AudioWorklet', typeof AudioWorkletNode !== 'undefined'],
       ['Audio Session API', 'audioSession' in navigator ? `あり（現在: ${navigator.audioSession.type}）` : 'なし'],
       ['Wake Lock API', 'wakeLock' in navigator],
@@ -172,6 +171,14 @@
     ];
   }
   const fmt = (n) => (typeof n === 'number' ? n.toFixed(4) : 'n/a');
+
+  function supportedConstraints() {
+    const md = navigator.mediaDevices;
+    if (!md || !md.getSupportedConstraints) return 'n/a';
+    const s = md.getSupportedConstraints();
+    return ['echoCancellation', 'noiseSuppression', 'autoGainControl', 'channelCount']
+      .map((k) => `${k}=${s[k] ? '○' : '×'}`).join(' ');
+  }
 
   function renderEnv() { renderKv($('env'), envEntries()); renderReport(); }
 
@@ -226,7 +233,9 @@
       $('micStart').disabled = true; $('micStop').disabled = false;
       draw();
     } catch (e) {
-      setStatus($('micStatus'), `マイクを開始できません: ${e.name} ${e.message}`, 'err');
+      const hint = e.name === 'InvalidStateError' && $('sessionType').value === 'playback'
+        ? '（Audio Session が playback だとマイクは使えません。auto か play-and-record にしてください）' : '';
+      setStatus($('micStatus'), `マイクを開始できません: ${e.name} ${e.message}${hint}`, 'err');
       log(`マイク開始エラー: ${e.name} ${e.message}`);
     }
   }
@@ -395,8 +404,20 @@
     catch { $('report').select(); setStatus($('miscStatus'), '自動コピーできません。テキストを長押しでコピーしてください', 'err'); }
   }
 
+  // 第1回の結果: 非表示で ctx は interrupted になり、表示で自動復帰。Wake Lock は非表示で解放される
+  async function onVisible() {
+    if (state.ctx && state.ctx.state !== 'running') {
+      try { await state.ctx.resume(); } catch (e) { log(`resume 失敗: ${e.message}`); }
+    }
+    if (state.wake && state.wake.released) {
+      try { state.wake = await navigator.wakeLock.request('screen'); log('Wake Lock を再取得'); }
+      catch (e) { log(`Wake Lock 再取得失敗: ${e.message}`); }
+    }
+  }
+
   document.addEventListener('visibilitychange', () => {
     log(`visibility: ${document.visibilityState} / mic=${state.stream ? state.stream.getAudioTracks()[0].readyState : 'off'} / ctx=${state.ctx ? state.ctx.state : 'none'}`);
+    if (document.visibilityState === 'visible') onVisible();
   });
 
   $('micStart').addEventListener('click', startMic);
