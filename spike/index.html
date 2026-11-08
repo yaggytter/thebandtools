@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>The Band Tools — 実機検証 1-0</title>
+<style>
+  :root { --bg:#111; --fg:#eee; --mute:#999; --card:#1c1c1e; --accent:#4cc2ff; --warn:#ffb340; --bad:#ff5a5a; --ok:#4cd964; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; padding-bottom:48px; background:var(--bg); color:var(--fg);
+         font:15px/1.6 -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:16px; margin:0 0 8px; }
+  section { background:var(--card); border-radius:12px; padding:14px; margin:12px 0; }
+  p.note { color:var(--mute); font-size:13px; margin:4px 0; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0; }
+  button, select, input { font:inherit; color:var(--fg); background:#2c2c2e; border:1px solid #3a3a3c;
+         border-radius:10px; padding:10px 14px; min-height:44px; }
+  button.primary { background:var(--accent); color:#000; border:none; font-weight:600; }
+  button:disabled { opacity:.4; }
+  input[type=number] { width:100px; }
+  canvas { width:100%; height:200px; background:#000; border-radius:8px; display:block; }
+  .big { font-size:28px; font-weight:700; font-variant-numeric:tabular-nums; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; }
+  .kv dt { color:var(--mute); } .kv dd { margin:0; word-break:break-all; }
+  label.check { display:flex; gap:8px; align-items:flex-start; margin:6px 0; }
+  label.check input { min-height:auto; width:22px; height:22px; flex:none; }
+  textarea { width:100%; height:180px; font:12px/1.4 ui-monospace, monospace; background:#000; color:var(--fg);
+             border-radius:8px; border:1px solid #3a3a3c; padding:8px; }
+  .status { font-size:13px; } .status.err { color:var(--bad); } .status.ok { color:var(--ok); }
+  .warn { color:var(--warn); }
+</style>
+</head>
+<body>
+<h1>The Band Tools — 実機検証 1-0</h1>
+<p class="note">iPhone Safari でマイク入力・音の出力がどう振る舞うかを確かめるページです。音声は端末の外に送信しません。</p>
+<p class="note warn">⚠ 音量は小さめから。大きいと感じたらすぐ下げてください。</p>
+
+<section>
+  <h2>① 環境情報</h2>
+  <dl class="kv" id="env"></dl>
+</section>
+
+<section>
+  <h2>② マイク入力とスペクトル</h2>
+  <div class="row">
+    <button class="primary" id="micStart">マイク開始</button>
+    <button id="micStop" disabled>マイク停止</button>
+  </div>
+  <div class="row">
+    <label>Audio Session
+      <select id="sessionType">
+        <option value="">（指定しない）</option>
+        <option value="auto">auto</option>
+        <option value="playback">playback</option>
+        <option value="play-and-record">play-and-record</option>
+        <option value="ambient">ambient</option>
+      </select>
+    </label>
+  </div>
+  <div class="status" id="micStatus">停止中</div>
+  <div class="row">
+    <div>ピーク <span class="big" id="peakHz">— Hz</span></div>
+    <div>レベル <span class="big" id="levelDb">— dB</span></div>
+  </div>
+  <canvas id="spectrum" width="1000" height="400"></canvas>
+  <p class="note">横軸: 50Hz〜18kHz（対数） / 縦軸: −120〜0 dBFS。150Hz 未満は灰色（内蔵マイクでは不正確）。</p>
+  <dl class="kv" id="trackSettings"></dl>
+</section>
+
+<section>
+  <h2>③ 音を鳴らす</h2>
+  <div class="row">
+    <label>周波数 <input type="number" id="toneHz" value="1000" min="50" max="16000" step="1"> Hz</label>
+    <label>出力
+      <select id="toneRoute">
+        <option value="center">左右同時</option>
+        <option value="left">左のみ</option>
+        <option value="right">右のみ</option>
+        <option value="inverted">逆位相（右を反転）</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <button class="primary" id="toneStart">鳴らす（−20dBFS）</button>
+    <button id="toneStop" disabled>止める</button>
+  </div>
+  <div class="status" id="toneStatus">停止中</div>
+</section>
+
+<section>
+  <h2>④ その他の確認</h2>
+  <div class="row">
+    <button id="wakeLock">画面スリープ防止（Wake Lock）</button>
+    <button id="persist">保存の永続化を要求</button>
+  </div>
+  <div class="status" id="miscStatus"></div>
+</section>
+
+<section>
+  <h2>⑤ 検証手順と結果</h2>
+  <p class="note">上から順に試して、当てはまるものにチェックしてください。</p>
+  <div id="checks"></div>
+  <div class="row">
+    <button class="primary" id="copy">結果をコピー</button>
+  </div>
+  <textarea id="report" readonly></textarea>
+</section>
+
+<script>
+(() => {
+  'use strict';
+
+  const FFT_SIZE = 8192;
+  const TONE_GAIN = 0.1;        // ≒ −20 dBFS
+  const FADE_SEC = 0.05;
+  const MIN_HZ = 50, MAX_HZ = 18000, UNRELIABLE_BELOW_HZ = 150;
+  const DB_MIN = -120, DB_MAX = 0;
+
+  const CHECKS = [
+    ['R1a', 'R1: マイク停止中に③で鳴らすと、下部スピーカーから普通の音量で聞こえる'],
+    ['R1b', 'R1: マイク開始後に③で鳴らすと、音が小さくなる/受話口（上部）から聞こえる'],
+    ['R1c', 'R1: Audio Session を play-and-record にしてマイク開始→鳴らすと、下部スピーカーから聞こえる'],
+    ['R1d', 'R1: Audio Session を playback にすると改善する'],
+    ['R2a', 'R2: 消音スイッチ（消音モード）ON で、③の音が鳴らない'],
+    ['R2b', 'R2: 消音 ON でも Audio Session = playback なら鳴る'],
+    ['R3a', 'R3: マイク開始中に③で 1000Hz を鳴らすと、ピーク表示がほぼ 1000Hz で安定する'],
+    ['R3b', 'R3: 同じ音を鳴らし続けると、レベルが数秒かけて下がる/上下する（自動補正が効いている疑い）'],
+    ['R3c', 'R3: 「アー」と一定の声を出すと、声の後に周囲音が不自然に小さく/大きくなる'],
+    ['R4a', 'R4: 100Hz を鳴らしてもピークが 100Hz にならない（低域が拾えない）'],
+    ['R5a', 'R5: 別アプリに切り替えて戻ると、マイクや音が止まっている'],
+    ['R6a', 'R6: Wake Lock 有効中、放置しても画面が消えない'],
+    ['R6b', 'R6: 画面ロック→解除後、マイクが止まっている（状態表示を確認）'],
+    ['R7a', 'R7: 保存の永続化が「許可」された'],
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const state = { ctx: null, stream: null, analyser: null, source: null, tone: null, raf: 0, wake: null, log: [] };
+
+  function log(msg) {
+    const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    state.log = [...state.log, line].slice(-50);
+    renderReport();
+  }
+
+  function setStatus(el, text, kind) {
+    el.textContent = text;
+    el.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function renderKv(dl, entries) {
+    dl.replaceChildren(...entries.flatMap(([k, v]) => {
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.textContent = String(v);
+      return [dt, dd];
+    }));
+  }
+
+  function envEntries() {
+    const ctx = state.ctx;
+    return [
+      ['UserAgent', navigator.userAgent],
+      ['HTTPS (secure context)', window.isSecureContext],
+      ['standalone (ホーム画面から起動)', window.navigator.standalone === true || matchMedia('(display-mode: standalone)').matches],
+      ['getUserMedia', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)],
+      ['AudioWorklet', typeof AudioWorkletNode !== 'undefined'],
+      ['Audio Session API', 'audioSession' in navigator ? `あり（現在: ${navigator.audioSession.type}）` : 'なし'],
+      ['Wake Lock API', 'wakeLock' in navigator],
+      ['storage.persist', !!(navigator.storage && navigator.storage.persist)],
+      ['AudioContext sampleRate', ctx ? ctx.sampleRate + ' Hz' : '（マイク開始後に表示）'],
+      ['baseLatency / outputLatency', ctx ? `${fmt(ctx.baseLatency)} / ${fmt(ctx.outputLatency)} s` : '—'],
+    ];
+  }
+  const fmt = (n) => (typeof n === 'number' ? n.toFixed(4) : 'n/a');
+
+  function renderEnv() { renderKv($('env'), envEntries()); renderReport(); }
+
+  function applySessionType() {
+    const type = $('sessionType').value;
+    if (!type || !('audioSession' in navigator)) return;
+    try {
+      navigator.audioSession.type = type;
+      log(`audioSession.type = ${type}`);
+    } catch (e) {
+      log(`audioSession.type の設定に失敗: ${e.message}`);
+    }
+    renderEnv();
+  }
+
+  async function ensureContext() {
+    if (!state.ctx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      state.ctx = new Ctx({ latencyHint: 'interactive' });
+      state.ctx.onstatechange = () => log(`AudioContext state: ${state.ctx.state}`);
+    }
+    if (state.ctx.state !== 'running') await state.ctx.resume();
+    renderEnv();
+    return state.ctx;
+  }
+
+  async function startMic() {
+    applySessionType();
+    try {
+      const ctx = await ensureContext();
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+      });
+      const track = stream.getAudioTracks()[0];
+      track.onended = () => { log('マイクのトラックが終了しました（ended）'); setStatus($('micStatus'), '停止（OS により終了）', 'err'); };
+      track.onmute = () => log('マイクがミュートされました（mute）');
+      track.onunmute = () => log('マイクのミュート解除（unmute）');
+
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = 0;
+      analyser.minDecibels = DB_MIN;
+      analyser.maxDecibels = DB_MAX;
+      source.connect(analyser);   // 出力には繋がない（ハウリング防止）
+
+      Object.assign(state, { stream, source, analyser });
+      const settings = track.getSettings ? track.getSettings() : {};
+      renderKv($('trackSettings'), Object.entries(settings).map(([k, v]) => [k, v]));
+      log(`マイク開始: ${JSON.stringify(settings)}`);
+      setStatus($('micStatus'), '入力中', 'ok');
+      $('micStart').disabled = true; $('micStop').disabled = false;
+      draw();
+    } catch (e) {
+      setStatus($('micStatus'), `マイクを開始できません: ${e.name} ${e.message}`, 'err');
+      log(`マイク開始エラー: ${e.name} ${e.message}`);
+    }
+  }
+
+  function stopMic() {
+    cancelAnimationFrame(state.raf);
+    if (state.stream) state.stream.getTracks().forEach((t) => t.stop());
+    if (state.source) state.source.disconnect();
+    Object.assign(state, { stream: null, source: null, analyser: null });
+    setStatus($('micStatus'), '停止中');
+    $('micStart').disabled = false; $('micStop').disabled = true;
+    log('マイク停止');
+  }
+
+  function findPeak(bins, sampleRate) {
+    const binHz = sampleRate / FFT_SIZE;
+    const lo = Math.ceil(MIN_HZ / binHz), hi = Math.min(bins.length - 2, Math.floor(MAX_HZ / binHz));
+    let best = lo;
+    for (let i = lo; i <= hi; i++) if (bins[i] > bins[best]) best = i;
+    const a = bins[best - 1], b = bins[best], c = bins[best + 1];
+    const denom = a - 2 * b + c;
+    const offset = denom !== 0 ? 0.5 * (a - c) / denom : 0;   // 放物線補間
+    return { hz: (best + offset) * binHz, db: b };
+  }
+
+  function rmsDb(analyser) {
+    const buf = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(buf);
+    const sum = buf.reduce((s, x) => s + x * x, 0);
+    return 10 * Math.log10(sum / buf.length + 1e-12);
+  }
+
+  function draw() {
+    const { analyser, ctx } = state;
+    if (!analyser) return;
+    const bins = new Float32Array(analyser.frequencyBinCount);
+    analyser.getFloatFrequencyData(bins);
+    const peak = findPeak(bins, ctx.sampleRate);
+    $('peakHz').textContent = `${peak.hz.toFixed(1)} Hz`;
+    $('levelDb').textContent = `${rmsDb(analyser).toFixed(1)} dB`;
+    drawSpectrum(bins, ctx.sampleRate, peak);
+    state.raf = requestAnimationFrame(draw);
+  }
+
+  function drawSpectrum(bins, sampleRate, peak) {
+    const cv = $('spectrum'), g = cv.getContext('2d');
+    const W = cv.width, H = cv.height, binHz = sampleRate / FFT_SIZE;
+    const xOf = (hz) => (Math.log10(hz / MIN_HZ) / Math.log10(MAX_HZ / MIN_HZ)) * W;
+    const yOf = (db) => H - ((Math.max(DB_MIN, Math.min(DB_MAX, db)) - DB_MIN) / (DB_MAX - DB_MIN)) * H;
+
+    g.fillStyle = '#000'; g.fillRect(0, 0, W, H);
+    g.fillStyle = 'rgba(255,255,255,0.06)'; g.fillRect(0, 0, xOf(UNRELIABLE_BELOW_HZ), H);
+    g.strokeStyle = '#333'; g.fillStyle = '#777'; g.font = '20px sans-serif';
+    for (const hz of [100, 250, 500, 1000, 2000, 4000, 8000, 16000]) {
+      const x = xOf(hz);
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke();
+      g.fillText(hz >= 1000 ? `${hz / 1000}k` : String(hz), x + 4, H - 6);
+    }
+    g.strokeStyle = '#4cc2ff'; g.lineWidth = 2; g.beginPath();
+    let started = false;
+    for (let i = 1; i < bins.length; i++) {
+      const hz = i * binHz;
+      if (hz < MIN_HZ || hz > MAX_HZ) continue;
+      const x = xOf(hz), y = yOf(bins[i]);
+      if (started) g.lineTo(x, y); else { g.moveTo(x, y); started = true; }
+    }
+    g.stroke();
+    g.strokeStyle = '#ff5a5a'; g.beginPath();
+    g.moveTo(xOf(peak.hz), 0); g.lineTo(xOf(peak.hz), H); g.stroke();
+  }
+
+  async function startTone() {
+    applySessionType();
+    const hz = Number($('toneHz').value);
+    if (!Number.isFinite(hz) || hz < 20 || hz > 20000) {
+      setStatus($('toneStatus'), '周波数は 20〜20000 Hz で指定してください', 'err');
+      return;
+    }
+    stopTone();
+    try {
+      const ctx = await ensureContext();
+      const osc = ctx.createOscillator();
+      osc.frequency.value = hz;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(TONE_GAIN, ctx.currentTime + FADE_SEC);
+      osc.connect(gain);
+
+      const route = $('toneRoute').value;
+      const merger = ctx.createChannelMerger(2);
+      const inv = ctx.createGain(); inv.gain.value = -1;
+      if (route === 'center' || route === 'left' || route === 'inverted') gain.connect(merger, 0, 0);
+      if (route === 'center' || route === 'right') gain.connect(merger, 0, 1);
+      if (route === 'inverted') { gain.connect(inv); inv.connect(merger, 0, 1); }
+      merger.connect(ctx.destination);
+      osc.start();
+
+      state.tone = { osc, gain };
+      setStatus($('toneStatus'), `再生中: ${hz} Hz / ${route} / マイク${state.stream ? 'ON' : 'OFF'}`, 'ok');
+      log(`トーン開始 ${hz}Hz route=${route} mic=${!!state.stream} session=${'audioSession' in navigator ? navigator.audioSession.type : 'n/a'}`);
+      $('toneStart').disabled = true; $('toneStop').disabled = false;
+    } catch (e) {
+      setStatus($('toneStatus'), `再生できません: ${e.message}`, 'err');
+      log(`トーンエラー: ${e.message}`);
+    }
+  }
+
+  function stopTone() {
+    const t = state.tone;
+    if (!t) return;
+    const now = state.ctx.currentTime;
+    t.gain.gain.cancelScheduledValues(now);
+    t.gain.gain.setValueAtTime(t.gain.gain.value, now);
+    t.gain.gain.linearRampToValueAtTime(0, now + FADE_SEC);
+    t.osc.stop(now + FADE_SEC + 0.01);
+    state.tone = null;
+    setStatus($('toneStatus'), '停止中');
+    $('toneStart').disabled = false; $('toneStop').disabled = true;
+    log('トーン停止');
+  }
+
+  async function toggleWakeLock() {
+    if (!('wakeLock' in navigator)) { setStatus($('miscStatus'), 'Wake Lock API がありません', 'err'); return; }
+    try {
+      if (state.wake) { await state.wake.release(); state.wake = null; setStatus($('miscStatus'), 'Wake Lock 解除'); log('Wake Lock 解除'); return; }
+      state.wake = await navigator.wakeLock.request('screen');
+      state.wake.addEventListener('release', () => log('Wake Lock が解放されました'));
+      setStatus($('miscStatus'), 'Wake Lock 有効', 'ok'); log('Wake Lock 有効');
+    } catch (e) {
+      setStatus($('miscStatus'), `Wake Lock 失敗: ${e.message}`, 'err'); log(`Wake Lock 失敗: ${e.message}`);
+    }
+  }
+
+  async function requestPersist() {
+    if (!(navigator.storage && navigator.storage.persist)) { setStatus($('miscStatus'), 'storage.persist がありません', 'err'); return; }
+    try {
+      const granted = await navigator.storage.persist();
+      setStatus($('miscStatus'), `永続化: ${granted ? '許可' : '拒否'}`, granted ? 'ok' : 'err');
+      log(`storage.persist() = ${granted}`);
+    } catch (e) {
+      setStatus($('miscStatus'), `永続化の要求に失敗: ${e.message}`, 'err'); log(`persist 失敗: ${e.message}`);
+    }
+  }
+
+  function renderChecks() {
+    $('checks').replaceChildren(...CHECKS.map(([id, text]) => {
+      const label = document.createElement('label'); label.className = 'check';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'chk-' + id;
+      cb.addEventListener('change', renderReport);
+      const span = document.createElement('span'); span.textContent = text;
+      label.append(cb, span);
+      return label;
+    }));
+  }
+
+  function renderReport() {
+    const env = envEntries().map(([k, v]) => `${k}: ${v}`);
+    const settings = [...$('trackSettings').querySelectorAll('dt')].map((dt) => `${dt.textContent}: ${dt.nextSibling.textContent}`);
+    const checks = CHECKS.map(([id, text]) => `[${$('chk-' + id)?.checked ? 'x' : ' '}] ${text}`);
+    $('report').value = ['# 環境', ...env, '', '# マイク設定（実際に適用された値）', ...settings, '', '# チェック', ...checks, '', '# ログ', ...state.log].join('\n');
+  }
+
+  async function copyReport() {
+    renderReport();
+    try { await navigator.clipboard.writeText($('report').value); setStatus($('miscStatus'), '結果をコピーしました', 'ok'); }
+    catch { $('report').select(); setStatus($('miscStatus'), '自動コピーできません。テキストを長押しでコピーしてください', 'err'); }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    log(`visibility: ${document.visibilityState} / mic=${state.stream ? state.stream.getAudioTracks()[0].readyState : 'off'} / ctx=${state.ctx ? state.ctx.state : 'none'}`);
+  });
+
+  $('micStart').addEventListener('click', startMic);
+  $('micStop').addEventListener('click', stopMic);
+  $('toneStart').addEventListener('click', startTone);
+  $('toneStop').addEventListener('click', stopTone);
+  $('sessionType').addEventListener('change', applySessionType);
+  $('wakeLock').addEventListener('click', toggleWakeLock);
+  $('persist').addEventListener('click', requestPersist);
+  $('copy').addEventListener('click', copyReport);
+
+  renderChecks();
+  renderEnv();
+})();
+</script>
+</body>
+</html>
